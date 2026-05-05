@@ -33,8 +33,9 @@ type Position struct {
 // by duration should treat zero as a sentinel, not a real value.
 //
 // ClosePrice note: for the synthetic "hl_sync_external" reason — positions
-// that disappeared from the exchange between reconcile cycles — both
-// ClosePrice and RealizedPnL are 0 (the real fill price is unknown). Downstream
+// that disappeared from the exchange between reconcile cycles — ClosePrice and
+// RealizedPnL are 0 when no mark price was available at reconcile time, and
+// approximate (mark-based, not the actual fill price) otherwise. Downstream
 // analytics that compute avg close price or slippage should filter
 // `close_reason != 'hl_sync_external'`.
 //
@@ -108,11 +109,15 @@ func recordClosedPosition(s *StrategyState, pos *Position, closePrice, realizedP
 	})
 }
 
-// recordPerpsStopLossClose books a tracked perps stop-loss fill and removes the
-// virtual position. Used both when HL reports an immediate trigger fill at
-// submit time and when a previously-resting trigger has fired between cycles.
-func recordPerpsStopLossClose(s *StrategyState, symbol string, triggerPx float64, reason string, logger *StrategyLogger) bool {
-	if triggerPx <= 0 {
+// bookPerpsClose is the shared close-booking path for perps: computes PnL at
+// closePx, deducts the platform taker fee, credits s.Cash, records a close
+// Trade + ClosedPosition, and removes the virtual position. detailsPrefix is
+// embedded in Trade.Details ("<prefix>, PnL: $X (fee $Y)") and logPrefix in
+// the strategy-logger Warn line ("<prefix> @ $px, PnL: $X (fee $Y)").
+// Returns false (no mutation) when closePx <= 0 or the position is missing,
+// so callers can choose a fallback path.
+func bookPerpsClose(s *StrategyState, symbol string, closePx float64, reason, detailsPrefix, logPrefix string, logger *StrategyLogger) bool {
+	if closePx <= 0 {
 		return false
 	}
 	pos, ok := s.Positions[symbol]
@@ -126,15 +131,15 @@ func recordPerpsStopLossClose(s *StrategyState, symbol string, triggerPx float64
 	side := pos.Side
 	var pnl float64
 	if side == "long" {
-		pnl = qty * (triggerPx - avgCost)
+		pnl = qty * (closePx - avgCost)
 	} else {
-		pnl = qty * (avgCost - triggerPx)
+		pnl = qty * (avgCost - closePx)
 	}
 	feePlatform := s.Platform
 	if s.Platform == "okx" && s.Type == "perps" {
 		feePlatform = "okx-perps"
 	}
-	fee := CalculatePlatformSpotFee(feePlatform, qty*triggerPx)
+	fee := CalculatePlatformSpotFee(feePlatform, qty*closePx)
 	pnl -= fee
 	s.Cash += pnl
 	positionID := ensurePositionTradeID(s.ID, symbol, pos)
@@ -146,10 +151,10 @@ func recordPerpsStopLossClose(s *StrategyState, symbol string, triggerPx float64
 		PositionID:  positionID,
 		Side:        closeTradeSide(side),
 		Quantity:    qty,
-		Price:       triggerPx,
-		Value:       qty * triggerPx,
+		Price:       closePx,
+		Value:       qty * closePx,
 		TradeType:   "perps",
-		Details:     fmt.Sprintf("Stop loss close, PnL: $%.2f (fee $%.2f)", pnl, fee),
+		Details:     fmt.Sprintf("%s, PnL: $%.2f (fee $%.2f)", detailsPrefix, pnl, fee),
 		IsClose:     true,
 		RealizedPnL: pnl,
 	}
@@ -158,13 +163,31 @@ func recordPerpsStopLossClose(s *StrategyState, symbol string, triggerPx float64
 	trade.StopLossTriggerPx = pos.StopLossTriggerPx
 	RecordTrade(s, trade)
 	RecordTradeResult(&s.RiskState, pnl)
-	recordClosedPosition(s, pos, triggerPx, pnl, reason, now)
+	recordClosedPosition(s, pos, closePx, pnl, reason, now)
 	delete(s.Positions, symbol)
 	clearATRMultMissingEntryATRWarningOnHLPerpsClose(s, symbol)
 	if logger != nil {
-		logger.Warn("SL close reconciled @ $%.4f, PnL: $%.2f (fee $%.2f)", triggerPx, pnl, fee)
+		logger.Warn("%s @ $%.4f, PnL: $%.2f (fee $%.2f)", logPrefix, closePx, pnl, fee)
 	}
 	return true
+}
+
+// recordPerpsStopLossClose books a tracked perps stop-loss fill and removes the
+// virtual position. Used both when HL reports an immediate trigger fill at
+// submit time and when a previously-resting trigger has fired between cycles.
+func recordPerpsStopLossClose(s *StrategyState, symbol string, triggerPx float64, reason string, logger *StrategyLogger) bool {
+	return bookPerpsClose(s, symbol, triggerPx, reason, "Stop loss close", "SL close reconciled", logger)
+}
+
+// recordPerpsExternalClose books a perps close detected by reconciliation
+// when the position has disappeared on-chain without a tracked trigger fill
+// (manual UI close, kill-switch close from a peer, etc.). The caller supplies
+// a close price (typically the current mark) so realized PnL is approximated
+// and credited to s.Cash — matching how recordPerpsStopLossClose handles the
+// SL-owner case. Returns false if the price is non-positive or the position
+// is missing, so callers can fall back to a zero-PnL recordClosedPosition (#584).
+func recordPerpsExternalClose(s *StrategyState, symbol string, closePx float64, reason string, logger *StrategyLogger) bool {
+	return bookPerpsClose(s, symbol, closePx, reason, "External close @ mark", "External close reconciled", logger)
 }
 
 // recordClosedOptionPosition appends a ClosedOptionPosition entry to the
