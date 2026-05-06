@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type hlProtectionPlan struct {
@@ -19,7 +20,7 @@ type hlProtectionPlan struct {
 }
 
 func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtectionPlan, bool) {
-	if sc.Type != "perps" || sc.Platform != "hyperliquid" || pos == nil {
+	if (sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid" || pos == nil {
 		return hlProtectionPlan{}, false
 	}
 	if pos.Symbol == "" || pos.Quantity <= 0 || pos.AvgCost <= 0 || pos.EntryATR <= 0 {
@@ -185,7 +186,9 @@ type jsonNumber interface {
 	Float64() (float64, error)
 }
 
-func syncHyperliquidProtection(sc StrategyConfig, plan hlProtectionPlan, notifier *MultiNotifier, logger *StrategyLogger) (*HyperliquidProtectionSyncResult, bool) {
+// syncHyperliquidProtection is a package var so tests can stub the subprocess
+// call without spawning Python. Production callers use runHyperliquidProtectionSync.
+var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, notifier *MultiNotifier, logger *StrategyLogger) (*HyperliquidProtectionSyncResult, bool) {
 	result, stderr, err := RunHyperliquidSyncProtection(
 		sc.Script, plan.Symbol, plan.Side, plan.Size, plan.AvgCost, plan.EntryATR,
 		plan.StopLossATRMult, plan.Tiers, plan.StopLossOID, plan.TPOIDs,
@@ -283,15 +286,67 @@ func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtection
 	}
 }
 
+// runHyperliquidProtectionSync is the locking + plan + subprocess + apply
+// pipeline shared by perps (open-no-trade and post-trade) and manual cycles.
+//
+//  1. RLock to build a plan from the current position; release.
+//  2. If a plan is required, call syncHyperliquidProtection (subprocess, no lock).
+//  3. Lock to re-validate position state and apply OID updates if the position
+//     is still the same side and qty>0 — guards against external close racing
+//     the subprocess.
+//
+// logTag is prepended to the success log line so callers can distinguish
+// open-no-trade vs. post-trade vs. manual sync sites. Returns true when the
+// apply step ran (false when no plan, subprocess failed, or the position
+// vanished/flipped during the subprocess).
+func runHyperliquidProtectionSync(
+	sc StrategyConfig,
+	stratState *StrategyState,
+	symbol string,
+	mu *sync.RWMutex,
+	notifier *MultiNotifier,
+	logger *StrategyLogger,
+	logTag string,
+) bool {
+	if stratState == nil || symbol == "" {
+		return false
+	}
+	var plan hlProtectionPlan
+	var syncOK bool
+	mu.RLock()
+	if pos, ok := stratState.Positions[symbol]; ok {
+		plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+	}
+	mu.RUnlock()
+	if !syncOK {
+		return false
+	}
+	protection, ok := syncHyperliquidProtection(sc, plan, notifier, logger)
+	if !ok || protection == nil {
+		return false
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	pos, ok := stratState.Positions[symbol]
+	if !ok || pos == nil || pos.Quantity <= 0 || pos.Side != plan.Side {
+		return false
+	}
+	applyHyperliquidProtectionSync(pos, protection)
+	if logger != nil {
+		logger.Info("%s (sl_oid=%d tp_oids=%v)", logTag, pos.StopLossOID, pos.TPOIDs)
+	}
+	return true
+}
+
 // hyperliquidPlacesOnChainTPs reports whether sc is configured to place
-// per-strategy on-chain reduce-only TP orders for HL perps. When true the
+// per-strategy on-chain reduce-only TP orders for HL perps/manual. When true the
 // in-process tiered close evaluator MUST be suppressed — the on-chain limits
 // are the source of truth for tiered exits, and running both produces a race
 // where the limit fills on-chain (shrinking position) and then the close
 // evaluator emits another close_fraction sized off the stale virtual qty
 // (#604 review #2).
 func hyperliquidPlacesOnChainTPs(sc StrategyConfig) bool {
-	if sc.Type != "perps" || sc.Platform != "hyperliquid" {
+	if (sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid" {
 		return false
 	}
 	return len(hyperliquidProtectionTiers(sc)) > 0

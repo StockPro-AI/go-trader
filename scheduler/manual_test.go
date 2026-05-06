@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -281,6 +282,55 @@ func TestApplyManualActionPartialClose(t *testing.T) {
 	}
 }
 
+func TestApplyManualActionCloseRejectsOwnerMismatch(t *testing.T) {
+	state := &AppState{
+		Strategies: map[string]*StrategyState{
+			"hl-manual-eth-live": {
+				ID:       "hl-manual-eth-live",
+				Platform: "hyperliquid",
+				Type:     "manual",
+				Positions: map[string]*Position{
+					"ETH": {
+						Symbol:          "ETH",
+						Quantity:        1,
+						AvgCost:         2000,
+						Side:            "long",
+						OwnerStrategyID: "hl-other-eth-live",
+					},
+				},
+				Cash: 10000,
+			},
+		},
+	}
+	scByID := map[string]StrategyConfig{
+		"hl-manual-eth-live": {ID: "hl-manual-eth-live", Type: "manual", Platform: "hyperliquid", Symbol: "ETH", Leverage: 10},
+	}
+
+	origRecorder := tradeRecorder
+	tradeRecorder = func(_ string, _ Trade) error {
+		t.Fatal("tradeRecorder should not be called for owner mismatch")
+		return nil
+	}
+	defer func() { tradeRecorder = origRecorder }()
+
+	err := applyManualAction(state, scByID, PendingManualAction{
+		StrategyID:  "hl-manual-eth-live",
+		Action:      "close",
+		Symbol:      "ETH",
+		Quantity:    1,
+		FillPrice:   2100,
+		RealizedPnL: 100,
+		IsFullClose: true,
+		CreatedAt:   time.Now().UTC(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "owned by") {
+		t.Fatalf("expected owner mismatch error, got: %v", err)
+	}
+	if pos := state.Strategies["hl-manual-eth-live"].Positions["ETH"]; pos == nil || pos.Quantity != 1 {
+		t.Fatalf("position should remain untouched, got %#v", pos)
+	}
+}
+
 // TestApplyManualAction99PercentPartialNotCollapsedToFull verifies that a
 // deliberate ~99% partial close is NOT collapsed into a full close (the prior
 // 0.99 relative tolerance would silently delete the residual dust).
@@ -396,5 +446,31 @@ func TestDrainPendingManualActions(t *testing.T) {
 	remaining, _ := db.LoadPendingManualActions()
 	if len(remaining) != 0 {
 		t.Errorf("expected empty queue after drain, got %d rows", len(remaining))
+	}
+}
+
+// TestManualPositionOwnedByStrategy covers the owner guard the CLI runManualClose
+// path, the drain path (applyManualAction), and the main-loop manual case all
+// share. Empty OwnerStrategyID is intentionally treated as owned for backward
+// compat with positions opened pre-#569 / discovered by the reconciler.
+func TestManualPositionOwnedByStrategy(t *testing.T) {
+	cases := []struct {
+		name     string
+		pos      *Position
+		strategy string
+		want     bool
+	}{
+		{"nil pos is treated as owned (no-op)", nil, "hl-manual-eth", true},
+		{"empty owner is treated as owned (legacy/reconciler)", &Position{}, "hl-manual-eth", true},
+		{"matching owner", &Position{OwnerStrategyID: "hl-manual-eth"}, "hl-manual-eth", true},
+		{"mismatched owner is rejected", &Position{OwnerStrategyID: "hl-other-eth"}, "hl-manual-eth", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := manualPositionOwnedByStrategy(tc.pos, tc.strategy); got != tc.want {
+				t.Errorf("manualPositionOwnedByStrategy(%+v, %q) = %v, want %v",
+					tc.pos, tc.strategy, got, tc.want)
+			}
+		})
 	}
 }
