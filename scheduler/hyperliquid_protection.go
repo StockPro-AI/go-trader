@@ -166,6 +166,13 @@ func tieredTPATRPrices(sc StrategyConfig, side string, entryPrice, entryATR floa
 	return tieredTPATRPricesFromTiers(strategyTPTiers(sc), side, entryPrice, entryATR)
 }
 
+// tieredTPATRPricesForRegime is tieredTPATRPrices with an explicit stamped regime
+// label so tiered_tp_atr_regime / tiered_tp_atr_live_regime resolve like
+// buildHyperliquidProtectionPlan (#738).
+func tieredTPATRPricesForRegime(sc StrategyConfig, side string, entryPrice, entryATR float64, regime string) []float64 {
+	return tieredTPATRPricesFromTiers(strategyTPTiersForRegime(sc, regime), side, entryPrice, entryATR)
+}
+
 // tieredTPATRPricesFromTiers is the price-only computation when the caller
 // already has tiers in hand — lets trade-alert extras call
 // strategyTPTiers once and zip prices with multiples (#665 review).
@@ -485,7 +492,11 @@ func hyperliquidPlacesOnChainTPs(sc StrategyConfig) bool {
 	if (sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid" {
 		return false
 	}
-	return len(strategyTPTiers(sc)) > 0
+	// Use strategyUsesTieredTPATRClose — not strategyTPTiers(sc) — because the
+	// latter passes an empty regime and returns nil for tiered_tp_atr_regime
+	// configs until pos.Regime is stamped, which left this gate false forever
+	// and skipped suppressing Python close evaluators (#750 / Sonnet review).
+	return strategyUsesTieredTPATRClose(sc)
 }
 
 // closeStrategiesSuppressedByOnChainProtection is the set of close evaluator

@@ -1052,10 +1052,9 @@ func positionMargin(qty, avgCost, leverage float64) float64 {
 }
 
 // strategyUsesTieredTPATRClose reports whether the strategy's configured close
-// evaluators include tiered_tp_atr or tiered_tp_atr_live. Both use the same
-// default 1×/2× tier multiples; hints are always priced from entry ATR × multiple
-// from avg_cost (see PR #529 review — live mode may use a different ATR ruler
-// at evaluation time, but the summary still shows the entry-ATR reference levels).
+// evaluators include any tiered_tp_atr* variant (scalar or regime, frozen or live).
+// Used for inspect-style questions and the on-chain-TP placement gate in
+// hyperliquidPlacesOnChainTPs.
 func strategyUsesTieredTPATRClose(sc StrategyConfig) bool {
 	for _, ref := range sc.CloseStrategies {
 		if isTieredTPATRCloseName(ref.Name) {
@@ -1099,7 +1098,7 @@ func collectPositions(sc StrategyConfig, ss *StrategyState, prices map[string]fl
 				extras += fmt.Sprintf(" | SL: $%s (%s)", fmtComma2(pos.StopLossTriggerPx), fmtPnlPct(slPct))
 			}
 		}
-		if tps := tieredTPATRPrices(sc, pos.Side, pos.AvgCost, pos.EntryATR); len(tps) > 0 {
+		if tps := tieredTPATRPricesForRegime(sc, pos.Side, pos.AvgCost, pos.EntryATR, pos.Regime); len(tps) > 0 {
 			// A zero TPOID alone is ambiguous (tiers also hold zero before the
 			// first protection-sync places them); require an observed shrink
 			// vs. InitialQuantity to mark a tier as filled (#662).
@@ -1190,7 +1189,7 @@ func tradeAlertExtras(sc StrategyConfig, trade Trade, isClose bool) []string {
 	var tiers []hlProtectionTier
 	var tps []float64
 	if !isClose && trade.EntryATR > 0 {
-		tiers = strategyTPTiers(sc)
+		tiers = strategyTPTiersForRegime(sc, trade.Regime)
 		tps = tieredTPATRPricesFromTiers(tiers, direction, trade.Price, trade.EntryATR)
 		if len(tps) > 0 {
 			extras = append(extras, fmt.Sprintf("ATR: $%s", fmtComma2(trade.EntryATR)))
