@@ -180,7 +180,7 @@ func TestFormatStrategyInspectionShowsResolvedTPSource(t *testing.T) {
 		"capital": true, "leverage": true, "sizing_leverage": true,
 		"margin_mode": true, "max_drawdown_pct": true, "stop_loss_atr_mult": true,
 	}
-	out := formatStrategyInspection(sc, explicit, &Config{IntervalSeconds: 600})
+	out := formatStrategyInspection(sc, explicit, &Config{IntervalSeconds: 600}, nil)
 
 	for _, want := range []string{
 		"strategy hl-rmc-eth-live",
@@ -219,7 +219,7 @@ func TestFormatStrategyInspectionMarksDefaultedFields(t *testing.T) {
 	}
 	// Operator only set id/type/platform/script/args/open_strategy.
 	explicit := map[string]bool{"id": true, "type": true, "platform": true, "script": true, "args": true, "open_strategy": true}
-	out := formatStrategyInspection(sc, explicit, &Config{IntervalSeconds: 600})
+	out := formatStrategyInspection(sc, explicit, &Config{IntervalSeconds: 600}, nil)
 
 	if !strings.Contains(out, "stop_loss_atr_mult (default)") {
 		t.Errorf("SL default marker missing.\nfull:\n%s", out)
@@ -292,7 +292,7 @@ func TestBuildStrategyInspectionJSONStableShape(t *testing.T) {
 	}
 	out := buildStrategyInspectionJSON(sc, map[string]bool{
 		"open_strategy": true, "close_strategies": true, "stop_loss_atr_mult": true,
-	}, &Config{IntervalSeconds: 600})
+	}, &Config{IntervalSeconds: 600}, nil)
 
 	bs, err := json.Marshal(out)
 	if err != nil {
@@ -362,7 +362,7 @@ func TestFormatStrategyInspectionRegimeTPUseDefaults(t *testing.T) {
 		"id": true, "type": true, "platform": true, "script": true,
 		"close_strategies": true, "leverage": true, "max_drawdown_pct": true,
 	}
-	out := formatStrategyInspection(sc, explicit, &Config{IntervalSeconds: 60})
+	out := formatStrategyInspection(sc, explicit, &Config{IntervalSeconds: 60}, nil)
 	if !strings.Contains(out, "tiered_tp_atr_regime tier[0]:") {
 		t.Errorf("missing tier[0] provenance line:\n%s", out)
 	}
@@ -386,5 +386,54 @@ func TestFormatStrategySummaryLineRegimeTPTierCount(t *testing.T) {
 	line := formatStrategySummaryLine(sc, nil)
 	if !strings.Contains(line, "tp=tiered_tp_atr_regime[2-tier]") {
 		t.Errorf("expected 2-tier regime TP summary, got: %s", line)
+	}
+}
+
+func TestFormatStrategyInspectionLegacyDirectionLabel(t *testing.T) {
+	sc := StrategyConfig{ID: "hl-plain", Type: "perps", Platform: "hyperliquid", Direction: DirectionLong}
+	out := formatStrategyInspection(sc, map[string]bool{"direction": true}, nil, nil)
+	if !strings.Contains(out, "  direction:           long") {
+		t.Errorf("strategies without regime_directional_policy should use legacy direction: label:\n%s", out)
+	}
+	if strings.Contains(out, "  base_direction:") {
+		t.Errorf("should not emit base_direction without policy:\n%s", out)
+	}
+}
+
+func TestFormatStrategyInspectionBaseDirectionWithPolicy(t *testing.T) {
+	sc := StrategyConfig{
+		ID: "hl-policy", Type: "perps", Platform: "hyperliquid", Direction: DirectionLong,
+		RegimeDirectionalPolicy: &RegimeDirectionalPolicy{TrendRegime: map[string]RegimeDirectionalEntry{
+			"trending_up": {Direction: DirectionLong}, "trending_down": {Direction: DirectionShort}, "ranging": {Direction: DirectionLong},
+		}},
+	}
+	out := formatStrategyInspection(sc, map[string]bool{"direction": true}, nil, nil)
+	if !strings.Contains(out, "  base_direction:      long") {
+		t.Errorf("policy strategies should use base_direction: label:\n%s", out)
+	}
+	if !strings.Contains(out, "  regime_directional_policy:") {
+		t.Errorf("missing policy table:\n%s", out)
+	}
+}
+
+func TestFormatStrategyInspectionPositionOrderDeterministic(t *testing.T) {
+	sc := StrategyConfig{ID: "hl-multi", Type: "perps", Platform: "hyperliquid", Direction: DirectionLong}
+	state := NewAppState()
+	state.Strategies["hl-multi"] = &StrategyState{
+		ID:   "hl-multi",
+		Type: "perps",
+		Positions: map[string]*Position{
+			"ETH": {Symbol: "ETH", Quantity: 1, Side: "long", Multiplier: 1, Leverage: 1},
+			"BTC": {Symbol: "BTC", Quantity: 0.1, Side: "short", Regime: "trending_down", Multiplier: 1, Leverage: 1},
+		},
+	}
+	out := formatStrategyInspection(sc, nil, nil, state)
+	btc := strings.Index(out, "position BTC:")
+	eth := strings.Index(out, "position ETH:")
+	if btc < 0 || eth < 0 {
+		t.Fatalf("missing position lines:\n%s", out)
+	}
+	if btc > eth {
+		t.Errorf("positions should be sorted by symbol (BTC before ETH), got BTC@%d ETH@%d", btc, eth)
 	}
 }

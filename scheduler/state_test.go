@@ -248,6 +248,106 @@ func TestValidatePerpsDirectionConfig_LegacyAllowShortsFallthrough(t *testing.T)
 	}
 }
 
+func makeRegimeDirectionalPolicyForValidation() *RegimeDirectionalPolicy {
+	return &RegimeDirectionalPolicy{TrendRegime: map[string]RegimeDirectionalEntry{
+		"trending_up":   {Direction: DirectionLong, InvertSignal: false},
+		"trending_down": {Direction: DirectionShort, InvertSignal: true},
+		"ranging":       {Direction: DirectionLong, InvertSignal: false},
+	}}
+}
+
+// #783: short under base direction=long is valid when stamped regime policy allows short.
+func TestValidatePerpsDirectionConfig_RegimePolicyStampedTrendingDown(t *testing.T) {
+	state := NewAppState()
+	state.Strategies["hl-mr-hype"] = &StrategyState{
+		ID:   "hl-mr-hype",
+		Type: "perps",
+		Positions: map[string]*Position{
+			"HYPE": {Symbol: "HYPE", Quantity: 1, Side: "short", Regime: "trending_down", Multiplier: 1, Leverage: 1},
+		},
+	}
+	cfg := &Config{
+		Strategies: []StrategyConfig{{
+			ID: "hl-mr-hype", Type: "perps", Platform: "hyperliquid", Direction: DirectionLong,
+			RegimeDirectionalPolicy: makeRegimeDirectionalPolicyForValidation(),
+		}},
+	}
+	if warnings := ValidatePerpsDirectionConfig(state, cfg); len(warnings) != 0 {
+		t.Fatalf("short under trending_down policy should not warn, got: %v", warnings)
+	}
+}
+
+// #783: short with stamped trending_up conflicts with policy long-only for that regime.
+func TestValidatePerpsDirectionConfig_RegimePolicyStampedTrendingUpConflict(t *testing.T) {
+	state := NewAppState()
+	state.Strategies["hl-mr-hype"] = &StrategyState{
+		ID:   "hl-mr-hype",
+		Type: "perps",
+		Positions: map[string]*Position{
+			"HYPE": {Symbol: "HYPE", Quantity: 1, Side: "short", Regime: "trending_up", Multiplier: 1, Leverage: 1},
+		},
+	}
+	cfg := &Config{
+		Strategies: []StrategyConfig{{
+			ID: "hl-mr-hype", Type: "perps", Platform: "hyperliquid", Direction: DirectionLong,
+			RegimeDirectionalPolicy: makeRegimeDirectionalPolicyForValidation(),
+		}},
+	}
+	warnings := ValidatePerpsDirectionConfig(state, cfg)
+	if len(warnings) != 1 {
+		t.Fatalf("want 1 warning for short under trending_up policy, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "stamped regime=\"trending_up\"") {
+		t.Errorf("warning should cite stamped regime, got: %s", warnings[0])
+	}
+}
+
+// #783: unstamped short with policy that allows short in some regime → no hard warning.
+func TestValidatePerpsDirectionConfig_RegimePolicyUnstampedAllowed(t *testing.T) {
+	state := NewAppState()
+	state.Strategies["hl-mr-hype"] = &StrategyState{
+		ID:   "hl-mr-hype",
+		Type: "perps",
+		Positions: map[string]*Position{
+			"HYPE": {Symbol: "HYPE", Quantity: 1, Side: "short", Multiplier: 1, Leverage: 1},
+		},
+	}
+	cfg := &Config{
+		Strategies: []StrategyConfig{{
+			ID: "hl-mr-hype", Type: "perps", Platform: "hyperliquid", Direction: DirectionLong,
+			RegimeDirectionalPolicy: makeRegimeDirectionalPolicyForValidation(),
+		}},
+	}
+	if warnings := ValidatePerpsDirectionConfig(state, cfg); len(warnings) != 0 {
+		t.Fatalf("unstamped short allowed by trending_down policy should not warn, got: %v", warnings)
+	}
+}
+
+// #784 re-review: warnings for multi-position strategies must be symbol-sorted.
+func TestValidatePerpsDirectionConfig_WarningOrderDeterministic(t *testing.T) {
+	state := NewAppState()
+	state.Strategies["hl-multi"] = &StrategyState{
+		ID:   "hl-multi",
+		Type: "perps",
+		Positions: map[string]*Position{
+			"ETH": {Symbol: "ETH", Quantity: 1, Side: "short", Multiplier: 1, Leverage: 1},
+			"BTC": {Symbol: "BTC", Quantity: 0.1, Side: "short", Multiplier: 1, Leverage: 1},
+		},
+	}
+	cfg := &Config{
+		Strategies: []StrategyConfig{{
+			ID: "hl-multi", Type: "perps", Platform: "hyperliquid", Direction: DirectionLong,
+		}},
+	}
+	warnings := ValidatePerpsDirectionConfig(state, cfg)
+	if len(warnings) != 2 {
+		t.Fatalf("want 2 warnings, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], " BTC ") || !strings.Contains(warnings[1], " ETH ") {
+		t.Errorf("warnings should be sorted by symbol (BTC before ETH), got:\n%s\n%s", warnings[0], warnings[1])
+	}
+}
+
 func TestLoadStateWithDB_SQLitePrimary(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "state.db")
